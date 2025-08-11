@@ -1,0 +1,120 @@
+# config.yaml
+world_size: 1
+master_port: 1234
+tensorboard: true
+pretrain: true
+
+num_epochs: 30
+start_epoch: 1
+start_batch: 0
+exp_dir: "zipformer/exp"
+
+bpe_model: "prepare_data/data/libri_bpe_500/bpe.model"
+
+base_lr: 0.045
+lr_batches: 7500
+lr_epochs: 3.5
+ref_duration: 600
+
+drop_last: true
+num_workers: 2
+
+context_size: 2
+prune_range: 5
+simple_loss_scale: 0.5
+ctc_loss_scale: 0.2
+cr_loss_scale: 0.2
+time_mask_ratio: 2.5
+attention_decoder_loss_scale: 0.8
+
+seed: 42
+print_diagnostics: false
+inf_check: false
+save_every_n: 4000
+keep_last_k: 30
+average_period: 200
+
+use_fp16: true
+use_bf16: false
+
+# --- Text data options (Pretrain) ---
+corpus_path: "/data/hwayeon/corpus"
+seq_len: 4096
+add_bos: true
+add_eos: true
+strip: true
+batch_size: 512
+prefetch_factor: 4
+
+# --- ASR data (Lhotse) options ---
+manifest_dir: "prepare_data/data/fbank"   # Path-like 값은 문자열로
+max_duration: 1000.0          # 초 단위
+
+bucketing_sampler: true
+num_buckets: 30
+
+concatenate_cuts: false
+duration_factor: 1.0
+gap: 1.0
+
+on_the_fly_feats: false
+shuffle: true
+return_cuts: true
+
+enable_spec_aug: true
+spec_aug_time_warp_factor: 80
+enable_musan: true
+
+input_strategy: "PrecomputedFeatures"   # or "AudioSamples"
+
+# ----- Zipformer encoder stacks -----
+num_encoder_layers: "2,2,3,4,3,2"
+downsampling_factor: "1,2,4,8,4,2"
+feedforward_dim: "512,768,1024,1536,1024,768"
+num_heads: "4,4,4,8,4,4"
+encoder_dim: "192,256,384,512,384,256"
+query_head_dim: 32
+value_head_dim: 12
+pos_head_dim: 4
+pos_dim: 48
+encoder_unmasked_dim: "192,192,256,256,256,192"
+cnn_module_kernel: "31,31,15,15,15,31"
+
+# ----- Decoder / Joiner / Attention Decoder -----
+decoder_dim: 512
+joiner_dim: 512
+
+attention_decoder_dim: 512
+attention_decoder_num_layers: 6
+attention_decoder_attention_dim: 512
+attention_decoder_num_heads: 8
+attention_decoder_feedforward_dim: 2048
+
+# ----- Causal / streaming -----
+causal: false
+chunk_size: "16,32,64,-1"
+left_context_frames: "64,128,256,-1"
+
+# ----- Heads on/off -----
+use_ctc: true
+use_attention_decoder: false
+use_cr_ctc: false
+
+# ----- get_params() 기본값 -----
+best_train_loss: .inf
+best_valid_loss: .inf
+best_train_epoch: -1
+best_valid_epoch: -1
+batch_idx_train: 0
+log_interval: 50
+reset_interval: 200
+valid_interval: 3000
+
+feature_dim: 80
+subsampling_factor: 4
+ignore_id: -1
+label_smoothing: 0.1
+warm_step: 2000
+
+# get_env_info()는 런타임에서 채우는 걸 권장
+env_info: null
