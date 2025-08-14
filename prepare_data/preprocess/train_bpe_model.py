@@ -65,9 +65,9 @@ def get_args():
     )
 
     parser.add_argument(
-        "--nproc",
+        "--nthread",
         type=int,
-        help="Number of process for training",
+        help="Number of threads for training",
     )
     return parser.parse_args()
 
@@ -84,24 +84,22 @@ def generate_tokens(lang_dir: Path):
             f.write(f"{sym} {i}\n")
 
 
-def line_iter(paths):
-    for p in paths:
-        with open(p, "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    yield line
+# def line_iter(paths):
+#     for root, dirs, files in os.walk(paths):
+#         for fname in files:
+#             file_path = os.path.join(root, fname)
+#             yield file_path
 
 
-def mix_iter(text_paths, speech_paths, p_libri=0.3):
-    iters = [line_iter(text_paths), speech_paths]
-    probs = [1-p_libri, p_libri]
-    while True:
-        src = random.choices([0,1], weights=probs, k=1)[0]
-        try:
-            yield next(iters[src])
-        except StopIteration:
-            break  # 실전에선 고갈된 쪽을 교체/루프 등 보완
+# def mix_iter(text_paths, speech_paths, p_libri=0.3):
+#     iters = [line_iter(text_paths), speech_paths]
+#     probs = [1-p_libri, p_libri]
+#     while True:
+#         src = random.choices([0,1], weights=probs, k=1)[0]
+#         try:
+#             yield next(iters[src])
+#         except StopIteration:
+#             break  # 실전에선 고갈된 쪽을 교체/루프 등 보완
 
 
 def main():
@@ -121,15 +119,16 @@ def main():
         train_text = [str(p) for p in Path(args.text_transcript).rglob("*.txt")]
         large_corpus = True
     elif args.speech_transcript and args.text_transcript:
-        train_text = mix_iter(args.text_transcript, args.speech_transcript)
+        train_text = [str(p) for p in Path(args.text_transcript).rglob("*.txt")]
+        speech_paths = [args.speech_transcript] * 30
+        train_text.extend(speech_paths)
         large_corpus = True
 
     
     character_coverage = 1.0
-    input_sentence_size = 100000000
+    # input_sentence_size = 100000000
 
-    user_defined_symbols = ["<blk>", "<sos/eos>"]
-    unk_id = len(user_defined_symbols)
+    user_defined_symbols = ["<blk>", "<sos>", "<eos>", "<pad>"]
     # Note: unk_id is fixed to 2.
     # If you change it, you should also change other
     # places that are using it.
@@ -141,17 +140,18 @@ def main():
             vocab_size=vocab_size,
             model_type=model_type,
             model_prefix=model_prefix,
-            input_sentence_size=input_sentence_size,
+            input_sentence_size=2_000_000,
             character_coverage=character_coverage,
             user_defined_symbols=user_defined_symbols,
             train_extremely_large_corpus=large_corpus,
             shuffle_input_sentence=True, 
             byte_fallback=True,
-            # hard_vocab_limit=False,
-            num_threads=args.nproc,
-            unk_id=unk_id,
-            bos_id=-1,
-            eos_id=-1,
+            hard_vocab_limit=False,
+            num_threads=args.nthread,
+            bos_id=0,
+            eos_id=1,
+            pad_id=2,
+            unk_id=3,
         )
     else:
         print(f"{model_file} exists - skipping")

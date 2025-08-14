@@ -3,6 +3,34 @@ from pathlib import Path
 import sentencepiece as spm
 import re, json
 from tqdm import tqdm
+import argparse
+
+
+
+def get_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--tokenizer-path",
+        type=str,
+        help="Path to tokenizer (*.model)",
+    )
+
+    parser.add_argument(
+        "--corpus-dir",
+        type=str,
+        default=None,
+        help="Path to corpus directory. Read *.txt under corpus_dir",
+    )
+    
+    parser.add_argument(
+        "--outfile",
+        type=str,
+        default="corpus_stats.json",
+        help="JSON file name",
+    )
+    
+    return parser.parse_args()
+
 
 def iter_lines(root):
     root = Path(root)
@@ -49,6 +77,8 @@ def token_stats_spm(spm_model_path, data_dir, max_lines=None):
     return stats
 
 if __name__ == "__main__":
-    s = token_stats_spm("/path/to/asr_unigram_2k.model", "/data/corpus/openwebtext_filtered")
-    with open("spm_token_stats.json", "w", encoding="utf-8") as f:
+    args = get_args()
+    s = token_stats_spm(args.tokenizer_path, args.corpus_dir)
+    save_dir = Path(args.tokenizer_path).parent
+    with open(save_dir / args.outfile, "w", encoding="utf-8") as f:
         json.dump(s, f, ensure_ascii=False, indent=2)
