@@ -60,6 +60,7 @@ from pathlib import Path
 from shutil import copyfile
 from typing import Any, Dict, Optional, Tuple, Union
 import yaml
+import random
 
 import k2
 import sentencepiece as spm
@@ -926,46 +927,149 @@ def run_text(
         model = DDP(model, device_ids=[rank], find_unused_parameters=True)
                 
     # Set optimizer and scheduler
-    optimizer = torch.optim.AdamW([{"params": train_params, "lr": params.base_lr, "weight_decay": 0.1}], betas=(0.9, 0.95), eps=1e-8)
-    max_steps = 200_000_000
-    scheduler = CosineAnnealingLR(optimizer, T_max=(max_steps - params.warm_step))
+    optimizer = torch.optim.AdamW(
+        [{"params": train_params, "lr": params.base_lr, "weight_decay": 0.1}], 
+        betas=(0.9, 0.95), eps=1e-8)
+    scheduler = CosineAnnealingLR(optimizer, T_max=(params.max_steps - params.warm_step))
 
     def step_scheduler(step):
         if step < params.warm_step:
-            for pg in opt.param_groups:
-                pg["lr"] = 3e-4 * (step + 1) / params.warm_step
+            # warmup to base_lr linearly
+            for pg in optimizer.param_groups:
+                pg["lr"] = params.base_lr * (step + 1) / params.warm_step
         else:
             scheduler.step()
     
-    loss_fn = torch.nn.CrossEntropyLoss(ignore_index=-100)
-
     model.to(device)
     if world_size > 1:
         logging.info("Using DDP")
         model = DDP(model, device_ids=[rank], find_unused_parameters=True)
 
-    text_dataset = TextIterableDataset(params, sp)
-    
-    collate = LMCollator(pad_token_id=sp.piece_to_id("<pad>"))
+    all_files = list(Path(params.corpus_path).rglob("*.txt"))
+    random.shuffle(all_files)
+    idx = int(len(all_files) * 0.99)  # 99% train, 1% valid
+
+    train_files, valid_files = all_files[:idx], all_files[idx:]
+
+    train_dataset = TextIterableDataset(params, sp, file_list=train_files)
+    valid_dataset = TextIterableDataset(params, sp, file_list=valid_files)
+    collate = LMCollator(seq_len=params.seq_len, pad_token_id=sp.pad_id())
+
     train_dl = DataLoader(
-        text_dataset, batch_size=params.batch_size, num_workers=params.num_workers,
-        prefetch_factor=params.prefetch_factor, collate_fn=collate)
-    
+        train_dataset, 
+        batch_size=params.batch_size,
+        num_workers=params.num_workers,
+        prefetch_factor=params.prefetch_factor,
+        collate_fn=collate,
+    )
+    valid_dl = DataLoader(
+        valid_dataset, 
+        batch_size=params.batch_size,
+        num_workers=params.num_workers,
+        prefetch_factor=params.prefetch_factor,
+        collate_fn=collate,
+    )
+
+    train_iter = iter(train_dl)
+    valid_iter = iter(valid_dl)
+
     scaler = create_grad_scaler(enabled=params.use_autocast, init_scale=1.0)
 
-    it = iter(train_dl)
-    for step in range(params.start_epoch, params.num_epochs):
-        batch = next(it)  # IterableDataset은 step 기반 루프가 편함
-        logits = model.decoder_forward(batch["input_ids"], attention_mask=batch["attention_mask"])
-        loss = loss_fn(logits.transpose(1,2), batch["labels"])
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
-        opt.step(); opt.zero_grad()
-        if step % args.log_itv == 0:
-            ppl = torch.exp(loss.detach())
-            print(f"[text] step={step} loss={loss:.4f} ppl={ppl:.2f}")
-        if step % args.ckpt_itv == 0 and step>0:
-            torch.save({"decoder": model.decoder.state_dict()}, f"ckpt_text_step{step}.pt")
+    start_steps = params.batch_idx_train
+    model.train()
+
+    for cur_step in range(start_steps, params.max_steps):
+        params.batch_idx_train += 1
+        
+        batch = next(train_iter) # IterableDataset은 step 기반 루프가 편함
+        optimizer.zero_grad()
+
+        with torch_autocast(enabled=params.use_autocast, dtype=params.dtype):
+            loss = model.forward_decoder(batch, device=device)
+
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
+
+        scaler.step(optimizer)
+        scaler.update()
+        step_scheduler(params.batch_idx_train)
+        
+        # Validation
+        if params.batch_idx_train % params.valid_interval == 0:
+            model.eval()
+            with torch.no_grad(), torch.autocast("cuda", enabled=params.use_autocast, dtype=params.dtype):
+                for _ in range(params.valid_max_batches):
+                    val_batch = next(valid_iter)
+                    val_loss = model.forward_decoder(
+                        val_batch["labels"].to(device), 
+                        pad_token_id=sp.pad_id(), 
+                        decoder_start_token_id=sp.piece_to_id("<sos/eos>"),
+                    )
+                if params.batch_idx_train % params.log_interval == 0:
+                    if tb_writer is not None:
+                        tb_writer.add_scalar(
+                            "valid/ce_loss", val_loss, params.batch_idx_train
+                        )
+
+            model.train()
+
+
+        if params.batch_idx_train % params.log_interval == 0:
+            cur_lr = max(scheduler.get_last_lr())
+            cur_grad_scale = scaler._scale.item() if params.use_autocast else 1.0
+
+            logging.info(
+                f"Step {params.batch_idx_train}, "
+                f"ce_loss[{loss}], batch size: {params.batch_size}, "
+                f"lr: {cur_lr:.2e}, "
+                f"grad_scale: {scaler._scale.item()}" if params.use_autocast else ""
+            )
+
+            if tb_writer is not None:
+                tb_writer.add_scalar(
+                    "train/learning_rate", cur_lr, params.batch_idx_train
+                )
+                tb_writer.add_scalar(
+                    "train/ce_loss", loss, params.batch_idx_train
+                )
+                if params.use_autocast:
+                    tb_writer.add_scalar(
+                        "train/grad_scale", cur_grad_scale, params.batch_idx_train
+                    )
+
+        if (
+            rank == 0
+            and params.batch_idx_train > 0
+            and params.batch_idx_train % params.average_period == 0
+        ):
+            update_averaged_model(
+                params=params,
+                model_cur=model,
+                model_avg=model_avg,
+            )
+
+        if (
+            params.batch_idx_train > 0
+            and params.batch_idx_train % params.save_every_n == 0
+        ):
+            save_checkpoint_with_global_batch_idx(
+                out_dir=params.exp_dir,
+                global_batch_idx=params.batch_idx_train,
+                model=model,
+                model_avg=model_avg,
+                params=params,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                sampler=None,
+                scaler=scaler,
+                rank=rank,
+            )
+            remove_checkpoints(
+                out_dir=params.exp_dir,
+                topk=params.keep_last_k,
+                rank=rank,
+            )
 
     logging.info("Done!")
 
@@ -1096,7 +1200,7 @@ def main(args):
 
     logging.info(params)
     logging.info(f"Saving params to {params.exp_dir}")
-    params.__saveattr__(params.exp_dir / "config.yaml")
+    params.save_yaml(params.exp_dir / "config.yaml")
     
     logging.info("About to create model")
     model = get_model(params)
