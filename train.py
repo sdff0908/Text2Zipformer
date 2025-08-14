@@ -61,6 +61,7 @@ from shutil import copyfile
 from typing import Any, Dict, Optional, Tuple, Union
 import yaml
 import random
+from tqdm import trange
 
 import k2
 import sentencepiece as spm
@@ -79,7 +80,7 @@ from lhotse.dataset.sampling.base import CutSampler
 from lhotse.utils import fix_random_seed
 
 from dataloader.asr_datamodule import LibriSpeechAsrDataModule
-from dataloader.text_datamodule import TextIterableDataset, LMCollator
+from dataloader.text_datamodule import TextIterableDataset, LMCollator, count_iterable_dl
 from zipformer.base import AsrModel
 from zipformer import optim
 from zipformer.optim import Eden, ScaledAdam
@@ -688,6 +689,9 @@ def run_speech(
     params: AttributeDict,
     sp: spm.SentencePieceProcessor,
     ):
+
+    setup_dist(rank, world_size, params.master_port)
+
     tb_writer = None
     if rank == 0:
         tb_writer = SummaryWriter(log_dir=f"{params.exp_dir}/tensorboard")
@@ -891,6 +895,8 @@ def run_text(
       args:
         The return value of get_parser().parse_args()
     """
+    setup_dist(rank, world_size, params.master_port)
+
     tb_writer = None
     if rank == 0:
         tb_writer = SummaryWriter(log_dir=f"{params.exp_dir}/tensorboard")
@@ -925,6 +931,7 @@ def run_text(
     if world_size > 1:
         logging.info("Using DDP")
         model = DDP(model, device_ids=[rank], find_unused_parameters=True)
+        model = model.module
                 
     # Set optimizer and scheduler
     optimizer = torch.optim.AdamW(
@@ -939,11 +946,6 @@ def run_text(
                 pg["lr"] = params.base_lr * (step + 1) / params.warm_step
         else:
             scheduler.step()
-    
-    model.to(device)
-    if world_size > 1:
-        logging.info("Using DDP")
-        model = DDP(model, device_ids=[rank], find_unused_parameters=True)
 
     all_files = list(Path(params.corpus_path).rglob("*.txt"))
     random.shuffle(all_files)
@@ -953,7 +955,7 @@ def run_text(
 
     train_dataset = TextIterableDataset(params, sp, file_list=train_files)
     valid_dataset = TextIterableDataset(params, sp, file_list=valid_files)
-    collate = LMCollator(seq_len=params.seq_len, pad_token_id=sp.pad_id())
+    collate = LMCollator(seq_len=params.seq_len, pad_id=sp.pad_id(), bos_id=sp.bos_id())
 
     train_dl = DataLoader(
         train_dataset, 
@@ -970,6 +972,13 @@ def run_text(
         collate_fn=collate,
     )
 
+    train_batch_num = count_iterable_dl(train_dl)
+    valid_batch_num = count_iterable_dl(valid_dl)
+    logging.info(f"Number of train batches: {train_batch_num}")
+    logging.info(f"Number of valid bathces: {valid_batch_num}") 
+    train_batch_num = max(train_batch_num, params.max_steps)
+    valid_batch_num = min(valid_batch_num, params.valid_max_batches)
+    
     train_iter = iter(train_dl)
     valid_iter = iter(valid_dl)
 
@@ -978,10 +987,15 @@ def run_text(
     start_steps = params.batch_idx_train
     model.train()
 
-    for cur_step in range(start_steps, params.max_steps):
+    for cur_step in trange(start_steps, train_batch_num):
         params.batch_idx_train += 1
         
-        batch = next(train_iter) # IterableDataset은 step 기반 루프가 편함
+        try:
+            batch = next(train_iter)
+        except StopIteration:
+            train_iter = iter(train_dl)
+            batch = next(train_iter)
+
         optimizer.zero_grad()
 
         with torch_autocast(enabled=params.use_autocast, dtype=params.dtype):
@@ -997,15 +1011,17 @@ def run_text(
         
         # Validation
         if params.batch_idx_train % params.valid_interval == 0:
+            logging.info("Validation Start")
             model.eval()
             with torch.no_grad(), torch.autocast("cuda", enabled=params.use_autocast, dtype=params.dtype):
-                for _ in range(params.valid_max_batches):
-                    val_batch = next(valid_iter)
-                    val_loss = model.forward_decoder(
-                        val_batch["labels"].to(device), 
-                        pad_token_id=sp.pad_id(), 
-                        decoder_start_token_id=sp.piece_to_id("<sos/eos>"),
-                    )
+                for _ in trange(valid_batch_num):
+                    try:
+                        batch = next(valid_iter)
+                    except StopIteration:
+                        valid_iter = iter(valid_dl)
+                        batch = next(valid_iter)
+                        
+                    val_loss = model.forward_decoder(batch, device=device)
                 if params.batch_idx_train % params.log_interval == 0:
                     if tb_writer is not None:
                         tb_writer.add_scalar(
@@ -1019,12 +1035,12 @@ def run_text(
             cur_lr = max(scheduler.get_last_lr())
             cur_grad_scale = scaler._scale.item() if params.use_autocast else 1.0
 
-            logging.info(
-                f"Step {params.batch_idx_train}, "
-                f"ce_loss[{loss}], batch size: {params.batch_size}, "
-                f"lr: {cur_lr:.2e}, "
-                f"grad_scale: {scaler._scale.item()}" if params.use_autocast else ""
-            )
+            # logging.info(
+            #     f"Step {params.batch_idx_train}, "
+            #     f"ce_loss[{loss}], batch size: {params.batch_size}, "
+            #     f"lr: {cur_lr:.2e}, "
+            #     f"grad_scale: {scaler._scale.item()}" if params.use_autocast else ""
+            # )
 
             if tb_writer is not None:
                 tb_writer.add_scalar(
@@ -1163,7 +1179,7 @@ def main(args):
     assert world_size >= 1
 
     fix_random_seed(params.seed)
-
+        
     setup_logger(f"{params.exp_dir}/log/log-train")
     logging.info("Training started")
 
