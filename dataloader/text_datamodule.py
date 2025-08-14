@@ -61,23 +61,27 @@ class TextIterableDataset(IterableDataset):
             rank = int(os.environ.get("RANK", "0"))
         return rank, world_size
 
+    def _shard(self, paths: List[str], rank: int, world_size: int):
+        # world_size: splitted number
+        total = len(paths)
+        per_rank = total // world_size
+        remainder = total % world_size
+            
+        start = rank * per_rank + min(rank, remainder)
+        end = start + per_rank + (1 if rank < remainder else 0)
+        sharded_paths = paths[start:end]
+        return sharded_paths, (start, end)
+
     def _assign_files(self) -> List[str]:
         # 파일을 (DDP 랭크 × 워커) 전체 샤드에 modulo 분배
-        worker = get_worker_info()
-        if worker is None:
-            worker_id, num_workers = 0, 1
-        else:
-            worker_id, num_workers = worker.id, worker.num_workers
-
-        rank, world = self._ddp_info()
-        global_worker_id = rank * num_workers + worker_id
-        total_shards = world * num_workers
-        return [f for i, f in enumerate(self.file_list) if (i % total_shards) == global_worker_id]
+        rank, world_size = self._ddp_info()
+        sharded_files, (start_idx, end_idx) = self._shard(self.file_list, rank, world_size)
+        logging.info(f"Assigned files from {start_idx} to {end_idx} among {len(self.file_list)} files")
+        return sharded_files
 
     # ---------- core ----------
     def __iter__(self) -> Iterable[torch.Tensor]:
         files = self._assign_files()
-        logging.info(f"Assigned files: {files}")
         # 토큰 버퍼: concat 후 seq_len+1 고정 길이 조각 산출
         buf: List[int] = []
 
@@ -115,14 +119,15 @@ class LMCollator:
     - attention_mask: [B, T-1]
     패딩은 tokenizer.pad_token_id 사용, labels의 패딩은 -100(ignore_index)
     """
-    def __init__(self, seq_len: int, pad_token_id: int, ignore_index: int = -100):
+    def __init__(self, seq_len: int, pad_id: int, bos_id: int, ignore_index: int = -100):
         self.seq_len = seq_len
-        self.pad_token_id = pad_token_id
+        self.pad_id = pad_id
+        self.bos_id = bos_id
         self.ignore_index = ignore_index
-
+        
     def __call__(self, batch: List[torch.Tensor]) -> Dict[str, torch.Tensor]:
         B = len(batch)
-        input_ids = torch.full((B, self.seq_len), self.pad_token_id, dtype=torch.long)
+        input_ids = torch.full((B, self.seq_len), self.pad_id, dtype=torch.long)
         labels = torch.full((B, self.seq_len), self.ignore_index, dtype=torch.long)
 
         for i, ids in enumerate(batch):
@@ -143,3 +148,10 @@ class LMCollator:
             "input_ids": input_ids,           # (B, T)
             "labels": labels,                 # (B, T)  (CrossEntropyLoss에 바로 사용)
         }
+        
+    
+def count_iterable_dl(dl):
+    cnt = 0
+    for _ in dl:
+        cnt += 1
+    return cnt
