@@ -227,19 +227,29 @@ class AttributeDict(dict):
             return
         raise AttributeError(f"No such attribute '{key}'")
 
-    def __str__(self, indent: int = 2):
+    def __str__(self, indent: int = 2, save_flag: bool = False):
         tmp = {}
         for k, v in self.items():
             # PosixPath is ont JSON serializable
             if isinstance(v, (pathlib.Path, torch.device, torch.dtype)):
                 v = str(v)
             tmp[k] = v
+            
+        if save_flag:
+            return tmp
         return json.dumps(tmp, indent=indent, sort_keys=True)
 
-    def __saveattr__(self, save_path, indent: int = 2):
-        str_dict = self.__str__(indent)
-        with open(save_path, "w") as f:
-            yaml.dump(str_dict, f)
+    def save_yaml(self, save_path, sort_keys=True):
+        data = self.__str__(save_flag=True)
+
+        with open(save_path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(
+                data,
+                f,
+                sort_keys=sort_keys,
+                allow_unicode=True,
+                default_flow_style=False,
+            )
 
         
             
