@@ -45,10 +45,12 @@ add_eos: true
 strip: true
 batch_size: 512
 prefetch_factor: 4
+max_steps: 100000000
+valid_max_batches: 1000
 
 # --- ASR data (Lhotse) options ---
-manifest_dir: "prepare_data/data/fbank"   # Path-like 값은 문자열로
-max_duration: 1000.0          # 초 단위
+manifest_dir: "prepare_data/data/fbank" 
+max_duration: 1000.0          # second
 
 bucketing_sampler: true
 num_buckets: 30
