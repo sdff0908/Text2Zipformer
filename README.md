@@ -29,11 +29,10 @@ cd openwebtext/
 git remote set-url origin https://<user_name>:<token>@huggingface.co/datasets/Skylion007/openwebtext
 git lfs pull
 
-cd ../prepare_data
-bash openwebtext.sh
+bash prepare_data/openwebtext.sh
 
 # LibriSpeech
-bash librispeech.sh
+bash prepare_data/librispeech.sh # prepare_data 아래에서 실행할 경우 storage_path=data/fbank
 
 # Tedlim3
 bash tedlium3.sh
