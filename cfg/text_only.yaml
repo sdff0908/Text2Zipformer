@@ -1,0 +1,66 @@
+# --- Env ---
+world_size: 1
+master_port: 1234
+seed: 42
+tensorboard: true
+pretrain: true
+env_info: null
+
+# --- Path ---
+exp_dir: "/data/hwayeon/text2zipformer/exp5"
+corpus_path: "/data/hwayeon/corpus"
+bpe_model: "prepare_data/data/libri_text_bpe_3000/bpe.model"
+
+# --- Data ---
+batch_idx_train: 0
+drop_last: true
+num_workers: 2
+seq_len: 4096
+batch_size: 256 
+prefetch_factor: 4
+valid_max_batches: 1000
+shuffle: true
+
+# --- Save/Log ---
+keep_last_k: 30
+average_period: 200
+log_interval: 100
+valid_interval: 200
+save_every_n: 100
+
+# --- Training ---
+num_epochs: 2
+base_lr: 0.00001
+warm_step: 30
+ignore_id: -100
+use_fp16: true
+use_bf16: false
+
+# ----- Model -----
+feature_dim: 80
+subsampling_factor: 4
+num_encoder_layers: "2,2,3,4,3,2"
+downsampling_factor: "1,2,4,8,4,2"
+feedforward_dim: "512,768,1024,1536,1024,768"
+num_heads: "4,4,4,8,4,4"
+encoder_dim: "192,256,384,512,384,256"
+query_head_dim: 32
+value_head_dim: 12
+pos_head_dim: 4
+pos_dim: 48
+encoder_unmasked_dim: "192,192,256,256,256,192"
+cnn_module_kernel: "31,31,15,15,15,31"
+decoder_dim: 512
+
+# ----- Causal / streaming -----
+causal: false
+chunk_size: "16,32,64,-1"
+left_context_frames: "64,128,256,-1"
+
+# ----- Decoding -----
+use_ctc: true
+use_attention_decoder: false
+use_cr_ctc: false
+
+
+
