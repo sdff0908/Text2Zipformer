@@ -61,6 +61,7 @@ from shutil import copyfile
 from typing import Any, Dict, Optional, Tuple, Union
 import yaml
 import random
+import math
 from tqdm import trange
 
 import k2
@@ -631,7 +632,7 @@ def train_one_epoch(
                 scaler.update(cur_grad_scale * 2.0)
 
         if batch_idx % params.log_interval == 0:
-            cur_lr = max(scheduler.get_last_lr())
+            cur_lr = scheduler.get_last_lr()
             cur_grad_scale = scaler._scale.item() if params.use_autocast else 1.0
 
             logging.info(
@@ -691,6 +692,7 @@ def run_speech(
     ):
 
     setup_dist(rank, world_size, params.master_port)
+    setup_logger(f"{params.exp_dir}/log/run-speech")
 
     tb_writer = None
     if rank == 0:
@@ -896,6 +898,7 @@ def run_text(
         The return value of get_parser().parse_args()
     """
     setup_dist(rank, world_size, params.master_port)
+    setup_logger(f"{params.exp_dir}/log/run-text")
 
     tb_writer = None
     if rank == 0:
@@ -915,12 +918,16 @@ def run_text(
             
     # 학습 대상 파라미터 수집
     train_names, train_params = [], []
+    num_params = 0
     for name, p in model.named_parameters():
         if p.requires_grad:
             train_names.append(name)
             train_params.append(p)
+            num_params += p.numel()
 
     logging.info(f"Trainable params: {train_names}")
+    logging.info(f"Number of training parameters: {num_params/1000000} M")
+
 
     model_avg: Optional[nn.Module] = None
     if rank == 0:
@@ -933,54 +940,60 @@ def run_text(
         model = DDP(model, device_ids=[rank], find_unused_parameters=True)
         model = model.module
                 
-    # Set optimizer and scheduler
-    optimizer = torch.optim.AdamW(
-        [{"params": train_params, "lr": params.base_lr, "weight_decay": 0.1}], 
-        betas=(0.9, 0.95), eps=1e-8)
-    scheduler = CosineAnnealingLR(optimizer, T_max=(params.max_steps - params.warm_step))
-
-    def step_scheduler(step):
-        if step < params.warm_step:
-            # warmup to base_lr linearly
-            for pg in optimizer.param_groups:
-                pg["lr"] = params.base_lr * (step + 1) / params.warm_step
-        else:
-            scheduler.step()
-
+    # Set data
     all_files = list(Path(params.corpus_path).rglob("*.txt"))
     random.shuffle(all_files)
     idx = int(len(all_files) * 0.99)  # 99% train, 1% valid
 
     train_files, valid_files = all_files[:idx], all_files[idx:]
 
-    train_dataset = TextIterableDataset(params, sp, file_list=train_files)
-    valid_dataset = TextIterableDataset(params, sp, file_list=valid_files)
-    collate = LMCollator(seq_len=params.seq_len, pad_id=sp.pad_id(), bos_id=sp.bos_id())
+    train_dataset = TextIterableDataset(params, sp, file_list=train_files, rank=rank, world_size=world_size)
+    valid_dataset = TextIterableDataset(params, sp, file_list=valid_files, rank=rank, world_size=world_size)
+    collater = LMCollator(seq_len=params.seq_len, pad_id=sp.pad_id(), bos_id=sp.bos_id())
 
     train_dl = DataLoader(
         train_dataset, 
         batch_size=params.batch_size,
         num_workers=params.num_workers,
         prefetch_factor=params.prefetch_factor,
-        collate_fn=collate,
+        collate_fn=collater,
     )
+
     valid_dl = DataLoader(
         valid_dataset, 
         batch_size=params.batch_size,
         num_workers=params.num_workers,
         prefetch_factor=params.prefetch_factor,
-        collate_fn=collate,
+        collate_fn=collater,
     )
 
     train_batch_num = count_iterable_dl(train_dl)
     valid_batch_num = count_iterable_dl(valid_dl)
     logging.info(f"Number of train batches: {train_batch_num}")
     logging.info(f"Number of valid bathces: {valid_batch_num}") 
-    train_batch_num = max(train_batch_num, params.max_steps)
+    train_batch_num = train_batch_num * params.num_epochs
     valid_batch_num = min(valid_batch_num, params.valid_max_batches)
     
     train_iter = iter(train_dl)
     valid_iter = iter(valid_dl)
+
+    # Set optimizer and scheduler
+    optimizer = torch.optim.AdamW(
+        [{"params": train_params, "lr": params.base_lr, "weight_decay": 0.1}], 
+        betas=(0.9, 0.95), eps=1e-8)
+
+    def lr_lambda(current_step):
+        min_lr = params.base_lr * 0.01
+        if current_step < params.warm_step:
+            return float(current_step + 1) / float(max(1, params.warm_step))
+        # cosine decay to min_lr
+        progress = float(current_step - params.warm_step) / float(max(1, train_batch_num - params.warm_step))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        # scale to [min_lr/base_lr, 1]
+        return (min_lr / params.base_lr) + (1.0 - (min_lr / params.base_lr)) * cosine
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+
 
     scaler = create_grad_scaler(enabled=params.use_autocast, init_scale=1.0)
 
@@ -1001,13 +1014,21 @@ def run_text(
         with torch_autocast(enabled=params.use_autocast, dtype=params.dtype):
             loss = model.forward_decoder(batch, device=device)
 
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
+        if params.use_autocast:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+        else:
+            loss.backward()
 
-        scaler.step(optimizer)
-        scaler.update()
-        step_scheduler(params.batch_idx_train)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 2.0)
+
+        if params.use_autocast:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
+
+        scheduler.step()
         
         # Validation
         if params.batch_idx_train % params.valid_interval == 0:
@@ -1172,8 +1193,10 @@ def scan_pessimistic_batches_for_oom(
 
 def main(args):
     
+    # Set parameters
     params = get_params(args.config_path)
     params.exp_dir = Path(params.exp_dir)
+    params.env_info = get_env_info()
     world_size = args.world_size
     params.world_size = world_size
     assert world_size >= 1
