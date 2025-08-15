@@ -7,7 +7,7 @@ import sentencepiece as spm
 import torch
 from torch.utils.data import IterableDataset, get_worker_info
 
-from icefall.utils import AttributeDict
+from icefall.utils import AttributeDict, setup_logger
 
 try:
     import torch.distributed as dist
@@ -30,6 +30,8 @@ class TextIterableDataset(IterableDataset):
         params: AttributeDict,
         sp: spm.SentencePieceProcessor,
         file_list: List,
+        rank: int,
+        world_size: int,
     ):
         super().__init__()
         self.file_list = file_list
@@ -38,6 +40,10 @@ class TextIterableDataset(IterableDataset):
 
         self.bos_id = self.sp.bos_id()
         self.eos_id = self.sp.eos_id()
+
+        self.rank = rank
+        self.world_size = world_size
+
     # ---------- helpers ----------
     @staticmethod
     def _open(fp: str) -> Iterator[str]:
@@ -48,40 +54,27 @@ class TextIterableDataset(IterableDataset):
         finally:
             f.close()
 
-    @staticmethod
-    def _ddp_info():
-        # 안전하게 DDP 정보 획득
-        world_size = 1
-        rank = 0
-        if dist is not None and dist.is_available() and dist.is_initialized():
-            world_size = dist.get_world_size()
-            rank = dist.get_rank()
-        else:
-            world_size = int(os.environ.get("WORLD_SIZE", "1"))
-            rank = int(os.environ.get("RANK", "0"))
-        return rank, world_size
-
-    def _shard(self, paths: List[str], rank: int, world_size: int):
+    def _shard(self, paths: List[str]):
         # world_size: splitted number
         total = len(paths)
-        per_rank = total // world_size
-        remainder = total % world_size
-            
-        start = rank * per_rank + min(rank, remainder)
-        end = start + per_rank + (1 if rank < remainder else 0)
+        per_rank = total // self.world_size
+        remainder = total % self.world_size
+        start = self.rank * per_rank + min(self.rank, remainder)
+        end = start + per_rank + (1 if self.rank < remainder else 0)
         sharded_paths = paths[start:end]
         return sharded_paths, (start, end)
 
     def _assign_files(self) -> List[str]:
-        # 파일을 (DDP 랭크 × 워커) 전체 샤드에 modulo 분배
-        rank, world_size = self._ddp_info()
-        sharded_files, (start_idx, end_idx) = self._shard(self.file_list, rank, world_size)
-        logging.info(f"Assigned files from {start_idx} to {end_idx} among {len(self.file_list)} files")
-        return sharded_files
+        sharded_files, (start_idx, end_idx) = self._shard(self.file_list)
+        return sharded_files, start_idx, end_idx
 
     # ---------- core ----------
     def __iter__(self) -> Iterable[torch.Tensor]:
-        files = self._assign_files()
+        files, start_idx, end_idx = self._assign_files()
+
+        setup_logger(f"{self.params.exp_dir}/log/log-data")
+        logging.info(f"[RANK {self.rank}: Assigned {end_idx-start_idx-1} files from {start_idx} to {end_idx-1} among {len(self.file_list)} files")
+
         # 토큰 버퍼: concat 후 seq_len+1 고정 길이 조각 산출
         buf: List[int] = []
 
